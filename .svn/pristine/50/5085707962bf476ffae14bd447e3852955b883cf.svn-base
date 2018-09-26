@@ -1,0 +1,40 @@
+#!/usr/bin/env groovy
+
+def call(jenkinsJobName, componentVmBuildId, vmBuildId) {
+
+	stage("Run Jenkins Job") {
+		echo "INSIDE OF runJenkinsJob FUNCTION"
+		try {
+			jenkinsJobNameForURL = jenkinsJobName.replace(" ", "%20")
+			
+			def getJenkinsParams = httpRequest consoleLogResponseBody: true, customHeaders: [[maskValue: true, name: 'Authorization', value: "Bearer ${jsonWebToken}"]], responseHandle: 'NONE', url: "http://${ecdbIP}/v-install_parameter_build?select=ParameterName,ParameterValue&&Component_VM_Build_ID=eq.${componentVmBuildId}&&ObjectID=eq.${jenkinsJobNameForURL}&&VM_Build_ID=eq.${vmBuildId}"
+			getJenkinsParamsResponse = readJSON text: getJenkinsParams.content			
+		}
+		catch(error) {
+			jenkinsJobNameForURL = jenkinsJobName.replace(" ", "%20")
+			
+			def getJenkinsParams = httpRequest consoleLogResponseBody: true, customHeaders: [[maskValue: true, name: 'Authorization', value: "Bearer ${jsonWebToken}"]], responseHandle: 'NONE', url: "http://${ecdbIP}/v-install_parameter_build?select=ParameterName,ParameterValue&&Component_VM_Build_ID=eq.${componentVmBuildId}&&ObjectID=eq.${jenkinsJobNameForURL}&&VM_Build_ID=eq.${vmBuildId}", validResponseCodes: '100:504'
+			getJenkinsParamsResponse = readJSON text: getJenkinsParams.content
+			
+			//write to file for error handling
+			sh """(echo Failed API call in runJenkinsJob.groovy; echo Reason: \"${getJenkinsParamsResponse.message}\"; echo) >> ${nfsPath}/chefparamfiles/FingerPrint-${BuildID}-Failed.txt"""
+			currentBuild.result = 'FAILURE'
+			throw new hudson.AbortException("Failed API: ${getJenkinsParamsResponse.message}")
+		}
+		
+		//installItemString = getInstallItems vmBuildId, compBuildId, customerID		
+		//echo "installItemString = ${installItemString}"	
+		
+		def myParams = []
+			
+		for (def myIndex = 0; myIndex < getJenkinsParamsResponse.size(); myIndex++) {
+			myParams.add(string(name: "${getJenkinsParamsResponse.ParameterName[myIndex]}", value:"${getJenkinsParamsResponse.ParameterValue[myIndex]}"))
+		}    
+		
+		def myTest = build job: jenkinsJobName, parameters: myParams, propagate: false, wait: true                           
+		def jobResult = myTest.getResult()
+		echo "jobResult = ${jobResult}"	
+				
+		return jobResult
+	}
+}

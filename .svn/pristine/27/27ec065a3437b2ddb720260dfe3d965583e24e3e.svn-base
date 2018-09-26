@@ -1,0 +1,91 @@
+def call(customerID, vmBuildId, compBuildId){
+	stage("Run install Items vmBuildId: ${vmBuildId}"){				
+		println("-------------run install items-----------------")
+		def jsonData
+			try {
+				def response1 = httpRequest consoleLogResponseBody: true, customHeaders: [[maskValue: true, name: 'Authorization', value: "Bearer ${jsonWebToken}"]], httpMode: 'POST', requestBody: "{\"customer_id\":${customerID}, \"vm_build_id\":${vmBuildId}}", responseHandle: 'NONE', url: "http://${ecdbIP}/rpc/terraform_vsphere"
+				jsonData = readJSON text: response1.content 
+			}
+			catch(error) {
+				def response1 = httpRequest consoleLogResponseBody: true, customHeaders: [[maskValue: true, name: 'Authorization', value: "Bearer ${jsonWebToken}"]], httpMode: 'POST', requestBody: "{\"customer_id\":${customerID}, \"vm_build_id\":${vmBuildId}}", responseHandle: 'NONE', url: "http://${ecdbIP}/rpc/terraform_vsphere", validResponseCodes: '100:504'
+				jsonData = readJSON text: response1.content 
+		
+				//write to file for error handling
+				sh """(echo Failed API call in getVmDetails.groovy; echo Reason: \"${jsonData.message}\"; echo) >> ${nfsPath}/chefparamfiles/FingerPrint-${BuildID}-Failed.txt"""
+				currentBuild.result = 'FAILURE'
+				throw new hudson.AbortException("Failed API: ${jsonData.message}")
+			}	
+			def CloudProvider = jsonData.vm_clone_data.CloudProvider[0]
+			def CloudEnvironment = jsonData.vm_clone_data.CloudEnvironment[0]
+			
+			def networkData = jsonData.vm_network_data
+			adminNetworkId = getAdminNetworkId CloudProvider, CloudEnvironment
+			def ipAddress = networkData.find { it['NetworkID'] ==  "${adminNetworkId}" }?.get("IPAddress")	
+				
+			//def ipAddress = jsonData.vm_network_data.IPAddress[0]
+			def hostname = jsonData.vm_clone_data.Hostname[0]
+			def os = jsonData.vm_clone_data.OSType[0]              
+            def componentVmBuildId
+			try {
+				def componentVmBuildIdJson = httpRequest consoleLogResponseBody: true, customHeaders: [[maskValue: true, name: 'Authorization', value: "Bearer ${jsonWebToken}"]], responseHandle: 'NONE', url: "http://${ecdbIP}/v-component_vm_build?select=Component_VM_Build_ID&&VM_Build_ID=eq.${vmBuildId}&&Component_Build_ID=eq.${compBuildId}"
+				componentVmBuildId = readJSON text: componentVmBuildIdJson.content
+				componentVmBuildId  = componentVmBuildId.Component_VM_Build_ID[0]
+			}
+			catch(error) {
+				def componentVmBuildIdJson = httpRequest consoleLogResponseBody: true, customHeaders: [[maskValue: true, name: 'Authorization', value: "Bearer ${jsonWebToken}"]], responseHandle: 'NONE', url: "http://${ecdbIP}/v-component_vm_build?select=Component_VM_Build_ID&&VM_Build_ID=eq.${vmBuildId}&&Component_Build_ID=eq.${compBuildId}", validResponseCodes: '100:504'
+				componentVmBuildId = readJSON text: componentVmBuildIdJson.content
+				
+				//write to file for error handling
+				sh """(echo Failed API call in getVmDetails.groovy; echo Reason: \"${componentVmBuildId.message}\"; echo) >> ${nfsPath}/chefparamfiles/FingerPrint-${BuildID}-Failed.txt"""
+				currentBuild.result = 'FAILURE'
+				throw new hudson.AbortException("Failed API: ${componentVmBuildId.message}")
+			}			
+            	  
+	  		def installItems
+			
+			try {
+				def installItemsResponse = httpRequest consoleLogResponseBody: true, customHeaders: [[maskValue: true, name: 'Authorization', value: "Bearer ${jsonWebToken}"]], 	responseHandle: 'NONE', url: "http://${ecdbIP}/v-install_item_build?select=ObjectID,ItemType,RunAs,BuildOrder&&Component_VM_Build_ID=eq.${componentVmBuildId}&&Built=eq.false&&ItemType=neq.Bootstrap&&order=BuildOrder.asc"
+                                                      
+				println('installItemsResponse from ECDB: '+installItemsResponse.content)
+                                                        
+				installItems = readJSON text: installItemsResponse.content
+			}
+			catch(error) {
+				def installItemsResponse = httpRequest consoleLogResponseBody: true, customHeaders: [[maskValue: true, name: 'Authorization', value: "Bearer ${jsonWebToken}"]], 	responseHandle: 'NONE', url: "http://${ecdbIP}/v-install_item_build?select=ObjectID,ItemType,RunAs,BuildOrder&&Component_VM_Build_ID=eq.${componentVmBuildId}&&Built=eq.false&&ItemType=neq.Bootstrap&&order=BuildOrder.asc", validResponseCodes: '100:504'
+				installItems = readJSON text: installItemsResponse.content
+				
+				//write to file for error handling
+				sh """(echo Failed API call in getVmDetails.groovy; echo Reason: \"${installItems.message}\"; echo) >> ${nfsPath}/chefparamfiles/FingerPrint-${BuildID}-Failed.txt"""
+				currentBuild.result = 'FAILURE'
+				throw new hudson.AbortException("Failed API: ${installItems.message}")
+			}       	
+        	for (def i = 0; i < installItems.size(); i++){
+		        echo "${i}"
+		               
+				recipeName = installItems.ObjectID[i]
+				itemType = installItems.ItemType[i]
+				runAs = installItems.RunAs[i]
+				buildOrder = installItems.BuildOrder[i]
+				
+		        echo "From loop:: recipeName : ${recipeName}, ItemType: ${itemType},runas :${runAs}, build order:${buildOrder}"
+				if(itemType == "Chef" || itemType == "Reboot"){
+				    echo "${hostname}, ${ipAddress}, ${customerID}, ${recipeName}, ${os}"
+				    runChefRecipe hostname, ipAddress, customerID, recipeName, os, CloudProvider, CloudEnvironment, itemType, runAs
+				     
+					updateInstallItemBuilt componentVmBuildId, buildOrder 
+				}
+				if(itemType == "Jenkins") {
+					jenkinsJobStatus = runJenkinsJob recipeName, componentVmBuildId, vmBuildId
+					if (jenkinsJobStatus == "SUCCESS") {
+						updateInstallItemBuilt componentVmBuildId, buildOrder
+					}
+					else {
+						currentBuild.result = 'FAILURE'
+						throw new hudson.AbortException('${jenkinsJobStatus} return status when running Jenkins job ${recipeName}')
+					}
+				}
+			}
+			//deleteParameterFile hostname, ipAddress, customerID, os, CloudProvider, CloudEnvironment, componentVmBuildId
+		}
+}      	    
+ 
